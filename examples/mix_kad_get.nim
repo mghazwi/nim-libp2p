@@ -5,19 +5,20 @@
 {.used.}
 
 import chronicles, chronos, results
-import std/[enumerate, sequtils, os, strformat]
+import std/[sequtils, strformat]
 import stew/byteutils
 import
   ../libp2p/[
     protocols/mix,
-    protocols/mix/mix_node,
     protocols/mix/mix_protocol,
+    protocols/mix/curve25519,
     protocols/kademlia,
     peerstore,
     multiaddress,
     switch,
     builders,
     multihash,
+    crypto/crypto,
     crypto/secp,
   ]
 
@@ -35,22 +36,6 @@ proc createSwitch(
   let skkey = libp2pPrivKey.valueOr(SkKeyPair.random(rng[]).seckey)
   let privKey = PrivateKey(scheme: Secp256k1, skkey: skkey)
   newStandardSwitchBuilder(privKey = Opt.some(privKey), addrs = multiAddr).build()
-
-proc setupMixSwitches(numNodes: int): seq[Switch] =
-  let mixNodes = initializeMixNodes(numNodes).expect("cant init mix nodes")
-  var nodes: seq[Switch] = @[]
-
-  for index, mixNode in enumerate(mixNodes):
-    let pubInfo =
-      mixNodes.getMixPubInfoByIndex(index).expect("cant get mix pub info")
-
-    pubInfo.writeToFile(index).expect("cant write mix pub info")
-    mixNode.writeToFile(index).expect("cant write mix node info")
-
-    let sw = createSwitch(mixNode.multiAddr, Opt.some(mixNode.libp2pPrivKey))
-    nodes.add(sw)
-
-  nodes
 
 proc setupKadNodes(numNodes: int): seq[KadDHT] =
   var nodes: seq[KadDHT] = @[]
@@ -111,18 +96,22 @@ proc newMixKadGetGateway(kad: KadDHT): MixKadGetGateway =
   proto
 
 proc mixKadGetSimulation() {.async: (raises: [Exception]).} =
-  let mixSwitches = setupMixSwitches(NumMixNodes)
+  let mixNodeInfos = MixNodeInfo.generateRandomMany(NumMixNodes)
+  var mixSwitches: seq[Switch] = @[]
+  var mixProtos: seq[MixProtocol] = @[]
+
+  for nodeInfo in mixNodeInfos:
+    let sw = createSwitch(nodeInfo.multiAddr, Opt.some(nodeInfo.libp2pPrivKey))
+    let mixProto = MixProtocol.new(nodeInfo, sw)
+    mixProto.nodePool.add(mixNodeInfos.includeAllExcept(nodeInfo))
+    mixProto.registerDestReadBehavior(MixKadGetCodec, readLp(MaxMsgSize))
+    sw.mount(mixProto)
+
+    mixSwitches.add(sw)
+    mixProtos.add(mixProto)
+
   defer:
     await mixSwitches.mapIt(it.stop()).allFutures()
-    deleteNodeInfoFolder()
-    deletePubInfoFolder()
-
-  var mixProtos: seq[MixProtocol] = @[]
-  for index, _ in enumerate(mixSwitches):
-    let mixProto = MixProtocol.new(index, mixSwitches.len, mixSwitches[index])
-    mixProto.registerDestReadBehavior(MixKadGetCodec, readLp(MaxMsgSize))
-    mixSwitches[index].mount(mixProto)
-    mixProtos.add(mixProto)
 
   let kads = setupKadNodes(NumKadNodes)
   defer:
